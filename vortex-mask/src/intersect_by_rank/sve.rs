@@ -15,8 +15,6 @@ use crate::Mask;
 pub(super) struct Sve2Bdep;
 
 impl DepositBits for Sve2Bdep {
-    const SKIP_TRIVIAL_RUNS: bool = false;
-
     #[inline]
     fn deposit_bits(source: u64, mask: u64, _mask_count: usize) -> u64 {
         // SAFETY: callers only instantiate this implementation after checking SVE2 BITPERM support.

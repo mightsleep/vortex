@@ -16,14 +16,12 @@ use crate::Mask;
 use crate::MaskValues;
 use crate::MaskValuesRef;
 
+#[cfg(target_arch = "x86_64")]
+mod bmi2;
 #[cfg(target_arch = "aarch64")]
 mod sve;
 
 trait DepositBits {
-    /// Whether to skip the deposit for blocks of eight `self` chunks that are all empty or all
-    /// full. Worth the check only when the deposit costs more than one instruction.
-    const SKIP_TRIVIAL_RUNS: bool;
-
     fn deposit_bits(source: u64, mask: u64, mask_count: usize) -> u64;
 }
 
@@ -38,9 +36,9 @@ trait SelectBit {
 struct Portable;
 
 impl DepositBits for Portable {
-    const SKIP_TRIVIAL_RUNS: bool = true;
-
-    #[inline]
+    // Inlined into the kernel loop: as a call per word it costs more than the closed forms.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn deposit_bits(source: u64, mask: u64, mask_count: usize) -> u64 {
         match mask_count {
             0..=2 => deposit_two_lowest(source, mask),
@@ -62,8 +60,6 @@ impl SelectBit for Portable {
 struct PortableLoop;
 
 impl DepositBits for PortableLoop {
-    const SKIP_TRIVIAL_RUNS: bool = false;
-
     #[inline]
     fn deposit_bits(mut source: u64, mut mask: u64, mask_count: usize) -> u64 {
         if mask_count <= 2 {
@@ -87,7 +83,8 @@ const fn bytes(b: u8) -> u64 {
 }
 
 /// Deposit into the lowest two set bits of `mask`.
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn deposit_two_lowest(source: u64, mask: u64) -> u64 {
     let lowest = mask & mask.wrapping_neg();
     let rest = mask ^ lowest;
@@ -96,7 +93,8 @@ fn deposit_two_lowest(source: u64, mask: u64) -> u64 {
 }
 
 /// Deposit into a mask with at most two clear bits: the source moves up by one past each hole.
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn deposit_two_holes(mut source: u64, mask: u64) -> u64 {
     let mut holes = !mask;
     for _ in 0..2 {
@@ -114,7 +112,8 @@ fn deposit_two_holes(mut source: u64, mask: u64) -> u64 {
 /// one multiply sums for all bytes. Within each byte the bits are spread by the compress network
 /// of Hacker's Delight 7-4 run backwards, as in `uN::extract_bits` of the Rust core library:
 /// three shift-and-XOR stages for 8 bits instead of six for 64.
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn deposit_bytewise(source: u64, mask: u64) -> u64 {
     let pairs = mask - ((mask >> 1) & bytes(0x55));
     let nibbles = (pairs & bytes(0x33)) + ((pairs >> 2) & bytes(0x33));
@@ -177,47 +176,6 @@ fn select_bit_position_portable(word: u64, mut rank: usize) -> usize {
 
     debug_assert!(false, "rank out of bounds");
     0
-}
-
-#[cfg(target_arch = "x86_64")]
-struct Bmi2;
-
-#[cfg(target_arch = "x86_64")]
-impl DepositBits for Bmi2 {
-    const SKIP_TRIVIAL_RUNS: bool = false;
-
-    #[inline]
-    fn deposit_bits(source: u64, mask: u64, _mask_count: usize) -> u64 {
-        // SAFETY: callers only instantiate this implementation after checking BMI2 support.
-        unsafe { pdep_bmi2(source, mask) }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-impl SelectBit for Bmi2 {
-    #[inline]
-    fn select_bit_position(word: u64, rank: usize) -> usize {
-        // SAFETY: callers only instantiate this implementation after checking BMI2 support.
-        unsafe { select_bit_position_bmi2(word, rank) }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2")]
-unsafe fn pdep_bmi2(source: u64, mask: u64) -> u64 {
-    use std::arch::x86_64;
-    x86_64::_pdep_u64(source, mask)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2")]
-unsafe fn select_bit_position_bmi2(word: u64, rank: usize) -> usize {
-    use std::arch::x86_64;
-    debug_assert!(rank < word.count_ones() as usize);
-    // PDEP places the rank-th bit of source into the rank-th set bit of mask, returning a single
-    // bit at the desired position.
-    let bit = x86_64::_pdep_u64(1u64 << rank, word);
-    bit.trailing_zeros() as usize
 }
 
 /// Reader that pulls variable-length (0..=64 bit) groups from a [`BitBuffer`] sequentially.
@@ -308,62 +266,22 @@ fn mask_from_buffer(buffer: BitBuffer, true_count: usize) -> Mask {
     }))
 }
 
-/// Whether each chunk of `self` lies in an aligned block of eight chunks that are all empty or
-/// all full, where the result chunk is just the rank bits read for it. A second iterator checks
-/// each block ahead of the loop, so the loop keeps one chunk per iteration.
-struct TrivialRuns<'a> {
-    ahead: BitChunkIterator<'a>,
-    left: usize,
-    trivial: bool,
-}
-
-impl<'a> TrivialRuns<'a> {
-    const BLOCK: usize = 8;
-
-    fn new(ahead: BitChunkIterator<'a>) -> Self {
-        Self {
-            ahead,
-            left: 0,
-            trivial: false,
-        }
-    }
-
-    #[inline]
-    fn next_is_trivial(&mut self) -> bool {
-        if self.left == 0 {
-            self.left = Self::BLOCK;
-            self.trivial = self.ahead.len() >= Self::BLOCK
-                && self
-                    .ahead
-                    .by_ref()
-                    .take(Self::BLOCK)
-                    .fold(true, |all, chunk| {
-                        all & ((chunk == 0) | (chunk == u64::MAX))
-                    });
-        }
-        self.left -= 1;
-        self.trivial
-    }
-}
-
 #[inline]
 fn push_result_chunk<D: DepositBits>(
     result: &mut BufferMut<u64>,
     self_chunk: u64,
     self_count: usize,
     rank_bits: u64,
-    trivial: bool,
 ) {
-    let chunk = if trivial {
-        rank_bits
-    } else {
-        D::deposit_bits(rank_bits, self_chunk, self_count)
-    };
-
+    let chunk = D::deposit_bits(rank_bits, self_chunk, self_count);
     // SAFETY: callers allocate enough capacity for every output chunk.
     unsafe { result.push_unchecked(chunk) };
 }
 
+/// Marked `#[inline(always)]` so each `#[target_feature]` wrapper in `bmi2` and `sve` gets its own
+/// fully-inlined copy compiled with that feature set, as in `vortex_buffer::bit::pack`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn intersect_bit_buffers<D: DepositBits>(
     self_buffer: &BitBuffer,
     mask_buffer: &BitBuffer,
@@ -373,20 +291,18 @@ fn intersect_bit_buffers<D: DepositBits>(
     let mut result = BufferMut::with_capacity(len.div_ceil(64));
     let mut reader = RankBitReader::new(mask_buffer);
     let self_chunks = self_buffer.chunks();
-    let mut runs = TrivialRuns::new(self_chunks.iter());
 
     for self_chunk in self_chunks.iter() {
         let self_count = self_chunk.count_ones() as usize;
         let rank_bits = reader.read(self_count);
-        let trivial = D::SKIP_TRIVIAL_RUNS && runs.next_is_trivial();
-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, trivial);
+        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
     }
 
     if self_chunks.remainder_len() != 0 {
         let self_chunk = self_chunks.remainder_bits();
         let self_count = self_chunk.count_ones() as usize;
         let rank_bits = reader.read(self_count);
-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, false);
+        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
     }
 
     mask_from_buffer(
@@ -395,6 +311,8 @@ fn intersect_bit_buffers<D: DepositBits>(
     )
 }
 
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
     self_buffer: &BitBuffer,
     mask_indices: &[usize],
@@ -404,14 +322,12 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
     let self_chunks = self_buffer.chunks();
     let mut rank_base = 0usize;
     let mut rank_idx = 0usize;
-    let mut runs = TrivialRuns::new(self_chunks.iter());
 
     for self_chunk in self_chunks.iter() {
         let self_count = self_chunk.count_ones() as usize;
         let next_rank_base = rank_base + self_count;
         let rank_bits = rank_bits_for_chunk(mask_indices, &mut rank_idx, rank_base, next_rank_base);
-        let trivial = D::SKIP_TRIVIAL_RUNS && runs.next_is_trivial();
-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, trivial);
+        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
         rank_base = next_rank_base;
     }
 
@@ -420,7 +336,7 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
         let self_count = self_chunk.count_ones() as usize;
         let next_rank_base = rank_base + self_count;
         let rank_bits = rank_bits_for_chunk(mask_indices, &mut rank_idx, rank_base, next_rank_base);
-        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits, false);
+        push_result_chunk::<D>(&mut result, self_chunk, self_count, rank_bits);
     }
 
     debug_assert_eq!(rank_idx, mask_indices.len());
@@ -437,6 +353,8 @@ fn intersect_bit_buffer_by_rank_indices<D: DepositBits>(
 ///
 /// This dominates the chunk-scan paths when the mask is very sparse: cost is
 /// `O(mask.true_count() + self.len() / 64)` rather than `O(self.len() / 64)` per chunk.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn intersect_mask_driven<S, I>(self_buffer: &BitBuffer, mask_indices: I, true_count: usize) -> Mask
 where
     S: SelectBit,
@@ -514,7 +432,7 @@ fn select_bit_buffers<P: DepositBits>() -> IntersectBuffers {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("bmi2") {
-            return intersect_bit_buffers::<Bmi2>;
+            return bmi2::intersect_bit_buffers_bmi2;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -531,7 +449,7 @@ fn select_rank_indices<P: DepositBits>() -> IntersectRankIndices {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("bmi2") {
-            return intersect_bit_buffer_by_rank_indices::<Bmi2>;
+            return bmi2::intersect_bit_buffer_by_rank_indices_bmi2;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -594,7 +512,8 @@ where
 {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("bmi2") {
-        return intersect_mask_driven::<Bmi2, _>(self_buffer, mask_indices, true_count);
+        // SAFETY: BMI2 was just detected.
+        return unsafe { bmi2::intersect_mask_driven_bmi2(self_buffer, mask_indices, true_count) };
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1049,13 +968,13 @@ mod tests {
     #[rstest]
     #[case::aligned(0)]
     #[case::offset(3)]
-    fn portable_intersect_with_trivial_runs(#[case] offset: usize) {
+    fn portable_kernels_match_reference(#[case] offset: usize) {
         kernels_match_reference::<Portable>(offset);
         kernels_match_reference::<PortableLoop>(offset);
     }
 
-    /// Both bit-buffer kernels with deposit `D`. Runs of empty and full chunks, aligned to the
-    /// blocks of eight and not, sit between random ones.
+    /// Both bit-buffer kernels with deposit `D`. Runs of empty and full chunks sit between
+    /// random ones.
     fn kernels_match_reference<D: DepositBits>(offset: usize) {
         let mut state = 0x2545_F491_4F6C_DD1D;
         let mut base_source = vec![false; offset];
