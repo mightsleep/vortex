@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::mem::MaybeUninit;
-
-use vortex_buffer::BufferMut;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -16,9 +12,9 @@ use crate::array::ArrayView;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::builtins::ArrayBuiltins;
-use crate::dtype::NativePType;
 use crate::match_each_native_ptype;
 use crate::scalar_fn::fns::zip::ZipKernel;
+use crate::scalar_fn::fns::zip::select_values;
 use crate::scalar_fn::fns::zip::zip_validity;
 
 /// A dedicated primitive zip kernel that selects values branchlessly per row.
@@ -67,77 +63,6 @@ impl ZipKernel for Primitive {
             PrimitiveArray::new(values.freeze(), validity).into_array()
         });
         Ok(Some(array))
-    }
-}
-
-/// Branchlessly blend `if_true` and `if_false` per row into a fresh value buffer.
-fn select_values<T: NativePType>(
-    true_values: &[T],
-    false_values: &[T],
-    mask: &Mask,
-) -> BufferMut<T> {
-    let len = true_values.len();
-    let mut out = BufferMut::<T>::with_capacity(len);
-    {
-        let out_slice = out.spare_capacity_mut();
-
-        let mask_bits = mask
-            .values()
-            .vortex_expect("mask is Mask::Values")
-            .bit_buffer();
-        // TODO(perf): `unaligned_chunks` is a faster single-buffer iterator than `chunks`; switch to
-        // it here, handling its lead/trailing padding.
-        let chunks = mask_bits.chunks();
-
-        let mut base = 0;
-        for word in chunks.iter() {
-            let end = base + 64;
-            select_block(
-                word,
-                &true_values[base..end],
-                &false_values[base..end],
-                &mut out_slice[base..end],
-            );
-            base = end;
-        }
-
-        let remainder = chunks.remainder_len();
-        if remainder > 0 {
-            let end = base + remainder;
-            select_block(
-                chunks.remainder_bits(),
-                &true_values[base..end],
-                &false_values[base..end],
-                &mut out_slice[base..end],
-            );
-        }
-    }
-
-    // SAFETY: `select_block` initialized every slot covered by the chunks plus remainder, i.e. `len`.
-    unsafe { out.set_len(len) };
-    out
-}
-
-/// Blend one 64-bit mask chunk's worth of rows: bit `j` (LSB-first) keeps `true_values[j]`, an unset
-/// bit keeps `false_values[j]`. Slices are trimmed to the output length up front so the compiler can
-/// elide bounds checks and lower the body to a vector blend / conditional move.
-#[inline]
-fn select_block<T: NativePType>(
-    word: u64,
-    true_values: &[T],
-    false_values: &[T],
-    out: &mut [MaybeUninit<T>],
-) {
-    let n = out.len();
-    let true_values = &true_values[..n];
-    let false_values = &false_values[..n];
-    for j in 0..n {
-        let pick = (word >> j) & 1 == 1;
-        out[j].write(if pick {
-            true_values[j]
-        } else {
-            false_values[j]
-        });
     }
 }
 
